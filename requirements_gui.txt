@@ -18,3 +18,5 @@ numpy>=1.21.0
 
 # Optional: For enhanced features
 pillow>=9.0.0  # For image thumbnails in future versions
+
+libewf-python
