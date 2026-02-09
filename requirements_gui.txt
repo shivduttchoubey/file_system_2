@@ -1,0 +1,20 @@
+# Forensic GUI Analyzer - Dependencies
+
+# Core GUI
+tk>=0.1.0
+
+# E01 Support (optional but recommended)
+# Note: pyewf requires libewf to be installed on system
+# Ubuntu/Debian: sudo apt-get install libewf-dev
+# macOS: brew install libewf
+# Windows: Download from https://github.com/libyal/libewf/releases
+# pyewf-python>=20140608
+
+# Alternative E01 library (easier to install)
+pytsk3>=20211111  # The Sleuth Kit Python bindings
+
+# Data analysis
+numpy>=1.21.0
+
+# Optional: For enhanced features
+pillow>=9.0.0  # For image thumbnails in future versions
