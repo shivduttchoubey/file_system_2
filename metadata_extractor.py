@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Fixed Metadata Extractor - Pre-scans filesystem structures for MACB timestamps
 This version properly finds and caches all MFT entries, inodes, and directory entries
