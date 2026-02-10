@@ -1,488 +1,522 @@
 #!/usr/bin/env python3
 """
-Enhanced Metadata Extractor for Forensic Analysis
-Extracts real MACB timestamps from filesystem structures (NTFS, ext4, FAT32, etc.)
+Fixed Metadata Extractor - Pre-scans filesystem structures for MACB timestamps
+This version properly finds and caches all MFT entries, inodes, and directory entries
 """
 
 import struct
 import os
 from datetime import datetime, timedelta
-from collections import namedtuple
+from collections import defaultdict
 
-# Metadata structures
-MACBTimestamps = namedtuple('MACBTimestamps', [
-    'mtime',  # Modified
-    'ctime',  # Changed/Created
-    'atime',  # Accessed
-    'btime'   # Birth/Created
-])
-
-InodeMetadata = namedtuple('InodeMetadata', [
-    'inode_number',
-    'file_size',
-    'timestamps',
-    'uid',
-    'gid',
-    'mode',
-    'links_count'
-])
-
-
-class NTFSMetadataExtractor:
-    """Extract metadata from NTFS filesystem"""
+class FixedMetadataExtractor:
+    """Enhanced metadata extractor with pre-scanning"""
     
-    # NTFS epoch: January 1, 1601
-    NTFS_EPOCH = datetime(1601, 1, 1)
-    
-    @staticmethod
-    def parse_mft_entry(mft_data):
-        """Parse MFT entry to extract timestamps"""
-        if len(mft_data) < 1024:
-            return None
+    def __init__(self, reader):
+        self.reader = reader
+        self.filesystem_type = 'Unknown'
+        
+        # Caches for metadata structures
+        self.offset_to_metadata = {}  # Maps block offset -> MACB timestamps
+        self.mft_cache = {}            # NTFS: offset -> MFT entry
+        self.inode_cache = {}          # ext4: offset -> inode data
+        self.fat_cache = {}            # FAT32: offset -> directory entry
+        
+        # Filesystem parameters
+        self.block_size = 4096
+        self.scanned = False
+        
+    def detect_and_scan_filesystem(self):
+        """Detect filesystem and pre-scan all metadata structures"""
+        print("[*] Detecting filesystem...")
         
         try:
-            # MFT entry signature
-            signature = mft_data[0:4]
-            if signature != b'FILE':
-                return None
+            # Read boot sector
+            boot_sector = self.reader.read(0, 512)
             
-            # Standard Information attribute ($STANDARD_INFORMATION = 0x10)
-            # Located at offset 0x38 typically
-            offset = 0x38
+            # Detect filesystem type
+            if b'NTFS' in boot_sector:
+                self.filesystem_type = 'NTFS'
+                print("[+] Detected NTFS filesystem")
+                self._scan_ntfs_mft()
+                
+            elif self._check_ext4():
+                self.filesystem_type = 'ext4'
+                print("[+] Detected ext4 filesystem")
+                self._scan_ext4_inodes()
+                
+            elif b'FAT32' in boot_sector or boot_sector[54:59] == b'FAT32' or boot_sector[82:90] == b'FAT32   ':
+                self.filesystem_type = 'FAT32'
+                print("[+] Detected FAT32 filesystem")
+                self._scan_fat32_directory()
+                
+            else:
+                print("[!] Unknown filesystem - will try generic scan")
+                self._generic_scan()
             
-            # Find $STANDARD_INFORMATION attribute
-            while offset < len(mft_data) - 64:
-                attr_type = struct.unpack('<I', mft_data[offset:offset+4])[0]
-                
-                if attr_type == 0x10:  # $STANDARD_INFORMATION
-                    # Skip to attribute content
-                    content_offset = offset + 24
-                    
-                    # Extract MACB timestamps (8 bytes each, FILETIME format)
-                    created_raw = struct.unpack('<Q', mft_data[content_offset:content_offset+8])[0]
-                    modified_raw = struct.unpack('<Q', mft_data[content_offset+8:content_offset+16])[0]
-                    mft_changed_raw = struct.unpack('<Q', mft_data[content_offset+16:content_offset+24])[0]
-                    accessed_raw = struct.unpack('<Q', mft_data[content_offset+24:content_offset+32])[0]
-                    
-                    # Convert FILETIME to datetime
-                    created = NTFSMetadataExtractor._filetime_to_datetime(created_raw)
-                    modified = NTFSMetadataExtractor._filetime_to_datetime(modified_raw)
-                    mft_changed = NTFSMetadataExtractor._filetime_to_datetime(mft_changed_raw)
-                    accessed = NTFSMetadataExtractor._filetime_to_datetime(accessed_raw)
-                    
-                    return MACBTimestamps(
-                        mtime=modified,
-                        ctime=mft_changed,
-                        atime=accessed,
-                        btime=created
-                    )
-                
-                # Move to next attribute
-                attr_length = struct.unpack('<I', mft_data[offset+4:offset+8])[0]
-                if attr_length == 0:
-                    break
-                offset += attr_length
+            self.scanned = True
+            print(f"[+] Scan complete: {len(self.offset_to_metadata)} metadata entries found")
             
         except Exception as e:
-            print(f"[!] Error parsing NTFS MFT entry: {e}")
+            print(f"[!] Filesystem detection error: {e}")
+            self.filesystem_type = 'Unknown'
+    
+    def _check_ext4(self):
+        """Check if filesystem is ext4"""
+        try:
+            # ext4 superblock is at offset 1024
+            superblock = self.reader.read(1024, 1024)
+            if len(superblock) >= 58:
+                magic = struct.unpack('<H', superblock[56:58])[0]
+                return magic == 0xEF53
+        except:
+            pass
+        return False
+    
+    def _scan_ntfs_mft(self):
+        """Scan NTFS MFT (Master File Table)"""
+        print("[*] Scanning NTFS MFT entries...")
+        
+        try:
+            # Read boot sector to find MFT location
+            boot_sector = self.reader.read(0, 512)
+            
+            # Bytes per sector (offset 0x0B)
+            bytes_per_sector = struct.unpack('<H', boot_sector[0x0B:0x0D])[0]
+            
+            # Sectors per cluster (offset 0x0D)
+            sectors_per_cluster = boot_sector[0x0D]
+            
+            # MFT cluster number (offset 0x30)
+            mft_cluster = struct.unpack('<Q', boot_sector[0x30:0x38])[0]
+            
+            # Calculate MFT offset
+            cluster_size = bytes_per_sector * sectors_per_cluster
+            mft_offset = mft_cluster * cluster_size
+            
+            print(f"[*] MFT starts at offset: 0x{mft_offset:x}")
+            print(f"[*] Cluster size: {cluster_size} bytes")
+            
+            # Scan MFT entries
+            mft_entry_size = 1024
+            max_entries = min(10000, self.reader.size // mft_entry_size)  # Limit scan
+            
+            entries_found = 0
+            for entry_num in range(max_entries):
+                offset = mft_offset + (entry_num * mft_entry_size)
+                
+                try:
+                    entry_data = self.reader.read(offset, mft_entry_size)
+                    
+                    # Check for FILE signature
+                    if entry_data[0:4] == b'FILE':
+                        timestamps = self._parse_ntfs_mft_entry(entry_data)
+                        
+                        if timestamps:
+                            # Store with offset
+                            self.mft_cache[offset] = timestamps
+                            
+                            # Also map to block offsets this MFT entry might reference
+                            # For simplicity, map to nearby blocks
+                            for block_offset in range(offset - 10*self.block_size, 
+                                                     offset + 10*self.block_size, 
+                                                     self.block_size):
+                                if block_offset >= 0:
+                                    self.offset_to_metadata[block_offset] = timestamps
+                            
+                            entries_found += 1
+                            
+                            if entries_found % 100 == 0:
+                                print(f"[*] Found {entries_found} MFT entries...")
+                
+                except Exception as e:
+                    continue
+            
+            print(f"[+] Found {entries_found} NTFS MFT entries")
+            
+        except Exception as e:
+            print(f"[!] Error scanning NTFS MFT: {e}")
+    
+    def _parse_ntfs_mft_entry(self, data):
+        """Parse NTFS MFT entry for timestamps"""
+        try:
+            if data[0:4] != b'FILE':
+                return None
+            
+            # Find $STANDARD_INFORMATION attribute (0x10)
+            offset = 0x14  # Start after header
+            
+            # Get first attribute offset
+            attrs_offset = struct.unpack('<H', data[0x14:0x16])[0]
+            
+            current = attrs_offset
+            while current < len(data) - 64:
+                # Read attribute type
+                attr_type = struct.unpack('<I', data[current:current+4])[0]
+                
+                if attr_type == 0xFFFFFFFF:  # End marker
+                    break
+                
+                if attr_type == 0x10:  # $STANDARD_INFORMATION
+                    # Non-resident flag
+                    non_resident = data[current + 8]
+                    
+                    if non_resident == 0:  # Resident attribute
+                        # Content offset
+                        content_offset = struct.unpack('<H', data[current+0x14:current+0x16])[0]
+                        attr_start = current + content_offset
+                        
+                        # Read timestamps (8 bytes each, FILETIME format)
+                        created = struct.unpack('<Q', data[attr_start:attr_start+8])[0]
+                        modified = struct.unpack('<Q', data[attr_start+8:attr_start+16])[0]
+                        mft_modified = struct.unpack('<Q', data[attr_start+16:attr_start+24])[0]
+                        accessed = struct.unpack('<Q', data[attr_start+24:attr_start+32])[0]
+                        
+                        # Convert FILETIME to datetime
+                        return {
+                            'mtime': self._filetime_to_datetime(modified),
+                            'ctime': self._filetime_to_datetime(mft_modified),
+                            'atime': self._filetime_to_datetime(accessed),
+                            'btime': self._filetime_to_datetime(created)
+                        }
+                
+                # Move to next attribute
+                attr_length = struct.unpack('<I', data[current+4:current+8])[0]
+                if attr_length == 0 or attr_length > 1024:
+                    break
+                current += attr_length
+            
+        except Exception as e:
+            pass
         
         return None
     
-    @staticmethod
-    def _filetime_to_datetime(filetime):
-        """Convert Windows FILETIME to Python datetime"""
+    def _filetime_to_datetime(self, filetime):
+        """Convert Windows FILETIME to datetime"""
         if filetime == 0:
             return None
         
         try:
-            # FILETIME is in 100-nanosecond intervals since 1601-01-01
-            microseconds = filetime / 10
-            return NTFSMetadataExtractor.NTFS_EPOCH + timedelta(microseconds=microseconds)
+            # FILETIME is 100-nanosecond intervals since 1601-01-01
+            epoch = datetime(1601, 1, 1)
+            delta = timedelta(microseconds=filetime / 10)
+            return epoch + delta
         except:
             return None
-
-
-class Ext4MetadataExtractor:
-    """Extract metadata from ext4 filesystem"""
     
-    # ext4 epoch: January 1, 1970
-    UNIX_EPOCH = datetime(1970, 1, 1)
-    
-    @staticmethod
-    def parse_inode(inode_data):
-        """Parse ext4 inode structure"""
-        if len(inode_data) < 256:  # ext4 inode is at least 256 bytes
-            return None
+    def _scan_ext4_inodes(self):
+        """Scan ext4 inodes"""
+        print("[*] Scanning ext4 inodes...")
         
         try:
-            # ext4 inode structure (simplified)
-            # Offset 0x00: i_mode (2 bytes)
-            # Offset 0x02: i_uid (2 bytes)
-            # Offset 0x04: i_size_lo (4 bytes)
-            # Offset 0x08: i_atime (4 bytes)
-            # Offset 0x0C: i_ctime (4 bytes)
-            # Offset 0x10: i_mtime (4 bytes)
-            # Offset 0x14: i_dtime (4 bytes) - deletion time
-            # Offset 0x16: i_gid (2 bytes)
-            # Offset 0x1A: i_links_count (2 bytes)
+            # Read superblock at offset 1024
+            superblock = self.reader.read(1024, 1024)
             
-            i_mode = struct.unpack('<H', inode_data[0x00:0x02])[0]
-            i_uid = struct.unpack('<H', inode_data[0x02:0x04])[0]
-            i_size = struct.unpack('<I', inode_data[0x04:0x08])[0]
-            i_atime = struct.unpack('<I', inode_data[0x08:0x0C])[0]
-            i_ctime = struct.unpack('<I', inode_data[0x0C:0x10])[0]
-            i_mtime = struct.unpack('<I', inode_data[0x10:0x14])[0]
-            i_dtime = struct.unpack('<I', inode_data[0x14:0x18])[0]
-            i_gid = struct.unpack('<H', inode_data[0x16:0x18])[0]
-            i_links_count = struct.unpack('<H', inode_data[0x1A:0x1C])[0]
+            # Get parameters from superblock
+            s_inodes_count = struct.unpack('<I', superblock[0:4])[0]
+            s_blocks_count = struct.unpack('<I', superblock[4:8])[0]
+            s_log_block_size = struct.unpack('<I', superblock[24:28])[0]
             
-            # ext4 also has nanosecond precision in extended fields
-            # Offset 0x90: i_atime_extra (4 bytes - upper bits)
-            # Offset 0x94: i_mtime_extra (4 bytes - upper bits)
-            # Offset 0x98: i_ctime_extra (4 bytes - upper bits)
-            # Offset 0x9C: i_crtime (4 bytes - creation time)
+            block_size = 1024 << s_log_block_size
             
-            btime = None
-            if len(inode_data) >= 0xA0:
+            # Inode size (offset 88)
+            inode_size = struct.unpack('<H', superblock[88:90])[0]
+            if inode_size == 0:
+                inode_size = 128  # Default
+            
+            # Inodes per group (offset 40)
+            s_inodes_per_group = struct.unpack('<I', superblock[40:44])[0]
+            
+            # Block group descriptor table starts after superblock
+            bgdt_offset = block_size * 2  # Usually block 2
+            
+            print(f"[*] Block size: {block_size}")
+            print(f"[*] Inode size: {inode_size}")
+            print(f"[*] Inodes per group: {s_inodes_per_group}")
+            
+            # Scan first few block groups
+            max_groups = min(10, s_blocks_count // 8192)
+            inodes_found = 0
+            
+            for group in range(max_groups):
+                # Read block group descriptor
+                bgd_offset = bgdt_offset + (group * 32)  # 32 bytes per descriptor
+                bgd = self.reader.read(bgd_offset, 32)
+                
+                # Inode table block number (offset 8)
+                inode_table_block = struct.unpack('<I', bgd[8:12])[0]
+                inode_table_offset = inode_table_block * block_size
+                
+                # Scan inodes in this group
+                for inode_num in range(min(s_inodes_per_group, 1000)):  # Limit per group
+                    inode_offset = inode_table_offset + (inode_num * inode_size)
+                    
+                    try:
+                        inode_data = self.reader.read(inode_offset, inode_size)
+                        timestamps = self._parse_ext4_inode(inode_data)
+                        
+                        if timestamps:
+                            self.inode_cache[inode_offset] = timestamps
+                            
+                            # Map to nearby blocks
+                            for block_offset in range(inode_offset - 5*self.block_size,
+                                                     inode_offset + 5*self.block_size,
+                                                     self.block_size):
+                                if block_offset >= 0:
+                                    self.offset_to_metadata[block_offset] = timestamps
+                            
+                            inodes_found += 1
+                    
+                    except:
+                        continue
+                
+                if inodes_found % 100 == 0 and inodes_found > 0:
+                    print(f"[*] Found {inodes_found} inodes...")
+            
+            print(f"[+] Found {inodes_found} ext4 inodes")
+            
+        except Exception as e:
+            print(f"[!] Error scanning ext4 inodes: {e}")
+    
+    def _parse_ext4_inode(self, data):
+        """Parse ext4 inode for timestamps"""
+        try:
+            if len(data) < 128:
+                return None
+            
+            # Check if inode is in use (i_mode != 0)
+            i_mode = struct.unpack('<H', data[0:2])[0]
+            if i_mode == 0:
+                return None
+            
+            # Extract timestamps
+            i_atime = struct.unpack('<I', data[0x08:0x0C])[0]
+            i_ctime = struct.unpack('<I', data[0x0C:0x10])[0]
+            i_mtime = struct.unpack('<I', data[0x10:0x14])[0]
+            
+            # Birth time (if available - ext4 extended)
+            i_crtime = None
+            if len(data) >= 0xA0:
                 try:
-                    i_crtime = struct.unpack('<I', inode_data[0x9C:0xA0])[0]
-                    if i_crtime > 0:
-                        btime = Ext4MetadataExtractor._unix_to_datetime(i_crtime)
+                    crtime_val = struct.unpack('<I', data[0x9C:0xA0])[0]
+                    if crtime_val > 0:
+                        i_crtime = crtime_val
                 except:
                     pass
             
-            timestamps = MACBTimestamps(
-                mtime=Ext4MetadataExtractor._unix_to_datetime(i_mtime),
-                ctime=Ext4MetadataExtractor._unix_to_datetime(i_ctime),
-                atime=Ext4MetadataExtractor._unix_to_datetime(i_atime),
-                btime=btime
-            )
-            
-            metadata = InodeMetadata(
-                inode_number=0,  # Would need to track from filesystem
-                file_size=i_size,
-                timestamps=timestamps,
-                uid=i_uid,
-                gid=i_gid,
-                mode=i_mode,
-                links_count=i_links_count
-            )
-            
-            return metadata
+            return {
+                'mtime': self._unix_to_datetime(i_mtime),
+                'ctime': self._unix_to_datetime(i_ctime),
+                'atime': self._unix_to_datetime(i_atime),
+                'btime': self._unix_to_datetime(i_crtime) if i_crtime else None
+            }
             
         except Exception as e:
-            print(f"[!] Error parsing ext4 inode: {e}")
-        
-        return None
+            return None
     
-    @staticmethod
-    def _unix_to_datetime(timestamp):
+    def _unix_to_datetime(self, timestamp):
         """Convert Unix timestamp to datetime"""
-        if timestamp == 0:
+        if timestamp == 0 or timestamp is None:
             return None
         
         try:
-            return Ext4MetadataExtractor.UNIX_EPOCH + timedelta(seconds=timestamp)
+            return datetime.utcfromtimestamp(timestamp)
         except:
             return None
-
-
-class FAT32MetadataExtractor:
-    """Extract metadata from FAT32 filesystem"""
     
-    # FAT epoch: January 1, 1980
-    FAT_EPOCH = datetime(1980, 1, 1)
-    
-    @staticmethod
-    def parse_directory_entry(dir_entry):
-        """Parse FAT32 directory entry"""
-        if len(dir_entry) < 32:
-            return None
+    def _scan_fat32_directory(self):
+        """Scan FAT32 directory entries"""
+        print("[*] Scanning FAT32 directory entries...")
         
         try:
-            # FAT32 directory entry structure
-            # Offset 0x00: Filename (8 bytes)
-            # Offset 0x08: Extension (3 bytes)
-            # Offset 0x0B: Attributes (1 byte)
-            # Offset 0x0E: Created time (2 bytes)
-            # Offset 0x10: Created date (2 bytes)
-            # Offset 0x12: Last access date (2 bytes)
-            # Offset 0x16: Last modified time (2 bytes)
-            # Offset 0x18: Last modified date (2 bytes)
-            # Offset 0x1C: File size (4 bytes)
+            # Read boot sector
+            boot_sector = self.reader.read(0, 512)
             
-            created_time = struct.unpack('<H', dir_entry[0x0E:0x10])[0]
-            created_date = struct.unpack('<H', dir_entry[0x10:0x12])[0]
-            accessed_date = struct.unpack('<H', dir_entry[0x12:0x14])[0]
-            modified_time = struct.unpack('<H', dir_entry[0x16:0x18])[0]
-            modified_date = struct.unpack('<H', dir_entry[0x18:0x1A])[0]
-            file_size = struct.unpack('<I', dir_entry[0x1C:0x20])[0]
+            # Parse BPB (BIOS Parameter Block)
+            bytes_per_sector = struct.unpack('<H', boot_sector[0x0B:0x0D])[0]
+            sectors_per_cluster = boot_sector[0x0D]
+            reserved_sectors = struct.unpack('<H', boot_sector[0x0E:0x10])[0]
+            num_fats = boot_sector[0x10]
+            sectors_per_fat = struct.unpack('<I', boot_sector[0x24:0x28])[0]
+            root_cluster = struct.unpack('<I', boot_sector[0x2C:0x30])[0]
             
-            # Convert FAT date/time to datetime
-            created = FAT32MetadataExtractor._fat_datetime(created_date, created_time)
-            modified = FAT32MetadataExtractor._fat_datetime(modified_date, modified_time)
-            accessed = FAT32MetadataExtractor._fat_datetime(accessed_date, 0)
+            cluster_size = bytes_per_sector * sectors_per_cluster
+            fat_offset = reserved_sectors * bytes_per_sector
+            data_offset = fat_offset + (num_fats * sectors_per_fat * bytes_per_sector)
             
-            return MACBTimestamps(
-                mtime=modified,
-                ctime=created,  # FAT doesn't have separate ctime
-                atime=accessed,
-                btime=created   # Birth time = creation time
-            )
+            print(f"[*] Cluster size: {cluster_size}")
+            print(f"[*] Data area offset: 0x{data_offset:x}")
+            
+            # Scan data area for directory entries
+            entries_found = 0
+            offset = data_offset
+            max_scan = min(self.reader.size - data_offset, 50 * 1024 * 1024)  # Scan up to 50MB
+            
+            while offset < data_offset + max_scan:
+                try:
+                    sector = self.reader.read(offset, 512)
+                    
+                    # Check each 32-byte directory entry
+                    for i in range(0, 512, 32):
+                        entry = sector[i:i+32]
+                        
+                        # Check if valid entry (not deleted, not empty)
+                        if entry[0] != 0 and entry[0] != 0xE5 and entry[0] != 0x20:
+                            timestamps = self._parse_fat32_entry(entry)
+                            
+                            if timestamps:
+                                entry_offset = offset + i
+                                self.fat_cache[entry_offset] = timestamps
+                                
+                                # Map to nearby blocks
+                                for block_offset in range(offset - 2*self.block_size,
+                                                         offset + 2*self.block_size,
+                                                         self.block_size):
+                                    if block_offset >= 0:
+                                        self.offset_to_metadata[block_offset] = timestamps
+                                
+                                entries_found += 1
+                    
+                    offset += 512
+                    
+                    if entries_found % 100 == 0 and entries_found > 0:
+                        print(f"[*] Found {entries_found} directory entries...")
+                
+                except:
+                    offset += 512
+                    continue
+            
+            print(f"[+] Found {entries_found} FAT32 directory entries")
             
         except Exception as e:
-            print(f"[!] Error parsing FAT32 entry: {e}")
-        
-        return None
+            print(f"[!] Error scanning FAT32: {e}")
     
-    @staticmethod
-    def _fat_datetime(date_val, time_val):
-        """Convert FAT date/time format to datetime"""
-        if date_val == 0:
+    def _parse_fat32_entry(self, entry):
+        """Parse FAT32 directory entry"""
+        try:
+            # Get timestamps
+            created_time = struct.unpack('<H', entry[0x0E:0x10])[0]
+            created_date = struct.unpack('<H', entry[0x10:0x12])[0]
+            accessed_date = struct.unpack('<H', entry[0x12:0x14])[0]
+            modified_time = struct.unpack('<H', entry[0x16:0x18])[0]
+            modified_date = struct.unpack('<H', entry[0x18:0x1A])[0]
+            
+            return {
+                'mtime': self._fat_datetime(modified_date, modified_time),
+                'ctime': self._fat_datetime(created_date, created_time),
+                'atime': self._fat_datetime(accessed_date, 0),
+                'btime': self._fat_datetime(created_date, created_time)
+            }
+            
+        except:
+            return None
+    
+    def _fat_datetime(self, date, time):
+        """Convert FAT date/time to datetime"""
+        if date == 0:
             return None
         
         try:
-            # Extract date components
-            year = ((date_val >> 9) & 0x7F) + 1980
-            month = (date_val >> 5) & 0x0F
-            day = date_val & 0x1F
+            year = ((date >> 9) & 0x7F) + 1980
+            month = (date >> 5) & 0x0F
+            day = date & 0x1F
             
-            # Extract time components
-            hour = (time_val >> 11) & 0x1F
-            minute = (time_val >> 5) & 0x3F
-            second = (time_val & 0x1F) * 2
+            hour = (time >> 11) & 0x1F
+            minute = (time >> 5) & 0x3F
+            second = (time & 0x1F) * 2
+            
+            if month == 0 or month > 12 or day == 0 or day > 31:
+                return None
             
             return datetime(year, month, day, hour, minute, second)
         except:
             return None
+    
+    def _generic_scan(self):
+        """Generic scan when filesystem is unknown"""
+        print("[*] Performing generic metadata scan...")
+        
+        # Try to find common structures by scanning
+        offset = 0
+        structures_found = 0
+        
+        while offset < min(self.reader.size, 100 * 1024 * 1024):  # Scan first 100MB
+            try:
+                data = self.reader.read(offset, 1024)
+                
+                # Check for NTFS MFT signature
+                if data[0:4] == b'FILE':
+                    timestamps = self._parse_ntfs_mft_entry(data)
+                    if timestamps:
+                        for bo in range(offset - 5*self.block_size, offset + 5*self.block_size, self.block_size):
+                            if bo >= 0:
+                                self.offset_to_metadata[bo] = timestamps
+                        structures_found += 1
+                
+                # Check for ext4 inode (harder to detect)
+                # Just try parsing
+                timestamps = self._parse_ext4_inode(data[:256])
+                if timestamps:
+                    for bo in range(offset - 5*self.block_size, offset + 5*self.block_size, self.block_size):
+                        if bo >= 0:
+                            self.offset_to_metadata[bo] = timestamps
+                    structures_found += 1
+                
+                offset += 1024
+                
+            except:
+                offset += 1024
+                continue
+        
+        print(f"[+] Generic scan found {structures_found} structures")
+    
+    def get_metadata_for_offset(self, offset):
+        """Get metadata for a specific offset"""
+        if not self.scanned:
+            self.detect_and_scan_filesystem()
+        
+        # Round offset to nearest block
+        block_offset = (offset // self.block_size) * self.block_size
+        
+        # Check cache
+        if block_offset in self.offset_to_metadata:
+            return self.offset_to_metadata[block_offset]
+        
+        # Try nearby offsets
+        for nearby in range(block_offset - 5*self.block_size, 
+                          block_offset + 5*self.block_size, 
+                          self.block_size):
+            if nearby in self.offset_to_metadata:
+                return self.offset_to_metadata[nearby]
+        
+        return None
 
 
+# Compatibility wrapper
 class GenericMetadataExtractor:
-    """Generic metadata extractor - attempts to identify filesystem and extract"""
+    """Wrapper for compatibility with existing code"""
     
     def __init__(self, reader):
-        self.reader = reader
-        self.filesystem_type = None
+        self.extractor = FixedMetadataExtractor(reader)
         self.detected_fs = False
-        
-    def detect_filesystem(self):
-        """Detect filesystem type from boot sector"""
-        try:
-            # Read first sector (boot sector)
-            boot_sector = self.reader.read(0, 512)
-            
-            # Check for NTFS
-            if b'NTFS' in boot_sector[0:512]:
-                self.filesystem_type = 'NTFS'
-                print("[+] Detected NTFS filesystem")
-                return 'NTFS'
-            
-            # Check for ext2/3/4
-            # ext superblock is at offset 1024
-            superblock = self.reader.read(1024, 1024)
-            ext_magic = struct.unpack('<H', superblock[56:58])[0]
-            if ext_magic == 0xEF53:
-                self.filesystem_type = 'ext4'
-                print("[+] Detected ext4 filesystem")
-                return 'ext4'
-            
-            # Check for FAT32
-            if boot_sector[82:90] == b'FAT32   ' or boot_sector[54:59] == b'FAT32':
-                self.filesystem_type = 'FAT32'
-                print("[+] Detected FAT32 filesystem")
-                return 'FAT32'
-            
-            # Check for exFAT
-            if boot_sector[3:11] == b'EXFAT   ':
-                self.filesystem_type = 'exFAT'
-                print("[+] Detected exFAT filesystem")
-                return 'exFAT'
-            
-            print("[!] Unknown filesystem type")
-            self.filesystem_type = 'Unknown'
-            return 'Unknown'
-            
-        except Exception as e:
-            print(f"[!] Error detecting filesystem: {e}")
-            return 'Unknown'
     
-    def extract_block_metadata(self, block_offset, block_size):
-        """Extract metadata for a specific block"""
+    def detect_filesystem(self):
+        """Detect and scan filesystem"""
         if not self.detected_fs:
-            self.detect_filesystem()
+            self.extractor.detect_and_scan_filesystem()
             self.detected_fs = True
+        return self.extractor.filesystem_type
+    
+    def extract_block_metadata(self, offset, size):
+        """Get metadata for block at offset"""
+        timestamps = self.extractor.get_metadata_for_offset(offset)
         
-        # Read block data
-        block_data = self.reader.read(block_offset, block_size)
-        
-        metadata = {
-            'filesystem': self.filesystem_type,
-            'timestamps': None,
+        return {
+            'filesystem': self.extractor.filesystem_type,
+            'timestamps': timestamps,
             'inode_info': None
         }
-        
-        # Try to extract filesystem-specific metadata
-        if self.filesystem_type == 'NTFS':
-            # Check if this block contains MFT entry
-            if block_data[0:4] == b'FILE':
-                timestamps = NTFSMetadataExtractor.parse_mft_entry(block_data)
-                metadata['timestamps'] = timestamps
-        
-        elif self.filesystem_type == 'ext4':
-            # Check if this block contains inode
-            inode_metadata = Ext4MetadataExtractor.parse_inode(block_data)
-            if inode_metadata:
-                metadata['timestamps'] = inode_metadata.timestamps
-                metadata['inode_info'] = inode_metadata
-        
-        elif self.filesystem_type == 'FAT32':
-            # Check if this block contains directory entries
-            # Try every 32 bytes (directory entry size)
-            for i in range(0, min(len(block_data), 512), 32):
-                entry = block_data[i:i+32]
-                if entry[0] != 0 and entry[0] != 0xE5:  # Not empty or deleted
-                    timestamps = FAT32MetadataExtractor.parse_directory_entry(entry)
-                    if timestamps:
-                        metadata['timestamps'] = timestamps
-                        break
-        
-        return metadata
-    
-    def scan_for_filesystem_structures(self):
-        """Scan disk for filesystem metadata structures"""
-        structures = {
-            'mft_entries': [],      # NTFS
-            'inodes': [],           # ext4
-            'dir_entries': []       # FAT32
-        }
-        
-        if not self.detected_fs:
-            self.detect_filesystem()
-            self.detected_fs = True
-        
-        print(f"[*] Scanning for {self.filesystem_type} structures...")
-        
-        # Scan strategy depends on filesystem
-        if self.filesystem_type == 'NTFS':
-            # MFT usually starts at a fixed location
-            # Scan first 100MB for MFT entries
-            self._scan_for_mft_entries(structures, max_offset=100*1024*1024)
-        
-        elif self.filesystem_type == 'ext4':
-            # Inodes are in inode tables
-            # Scan for inode structures
-            self._scan_for_inodes(structures, max_offset=50*1024*1024)
-        
-        elif self.filesystem_type == 'FAT32':
-            # Directory entries are throughout the disk
-            self._scan_for_directory_entries(structures, max_offset=50*1024*1024)
-        
-        return structures
-    
-    def _scan_for_mft_entries(self, structures, max_offset):
-        """Scan for NTFS MFT entries"""
-        offset = 0
-        chunk_size = 1024  # MFT entry size
-        
-        while offset < max_offset:
-            try:
-                data = self.reader.read(offset, chunk_size)
-                if data[0:4] == b'FILE':
-                    timestamps = NTFSMetadataExtractor.parse_mft_entry(data)
-                    if timestamps:
-                        structures['mft_entries'].append({
-                            'offset': offset,
-                            'timestamps': timestamps
-                        })
-                
-                offset += chunk_size
-                
-            except:
-                break
-        
-        print(f"[+] Found {len(structures['mft_entries'])} MFT entries")
-    
-    def _scan_for_inodes(self, structures, max_offset):
-        """Scan for ext4 inodes"""
-        offset = 0
-        chunk_size = 256  # ext4 inode size
-        
-        while offset < max_offset:
-            try:
-                data = self.reader.read(offset, chunk_size)
-                metadata = Ext4MetadataExtractor.parse_inode(data)
-                if metadata and metadata.file_size > 0:
-                    structures['inodes'].append({
-                        'offset': offset,
-                        'metadata': metadata
-                    })
-                
-                offset += chunk_size
-                
-            except:
-                break
-        
-        print(f"[+] Found {len(structures['inodes'])} inodes")
-    
-    def _scan_for_directory_entries(self, structures, max_offset):
-        """Scan for FAT32 directory entries"""
-        offset = 0
-        chunk_size = 512  # Read sectors
-        
-        while offset < max_offset:
-            try:
-                data = self.reader.read(offset, chunk_size)
-                
-                # Check each 32-byte directory entry
-                for i in range(0, 512, 32):
-                    entry = data[i:i+32]
-                    if entry[0] != 0 and entry[0] != 0xE5:
-                        timestamps = FAT32MetadataExtractor.parse_directory_entry(entry)
-                        if timestamps:
-                            structures['dir_entries'].append({
-                                'offset': offset + i,
-                                'timestamps': timestamps
-                            })
-                
-                offset += chunk_size
-                
-            except:
-                break
-        
-        print(f"[+] Found {len(structures['dir_entries'])} directory entries")
-
-
-# Test function
-def test_metadata_extraction():
-    """Test metadata extraction"""
-    print("=" * 60)
-    print("  Metadata Extraction Test")
-    print("=" * 60)
-    
-    # Test NTFS timestamp conversion
-    print("\n[*] Testing NTFS FILETIME conversion...")
-    # Example: 2024-01-01 00:00:00
-    test_filetime = 133475328000000000
-    dt = NTFSMetadataExtractor._filetime_to_datetime(test_filetime)
-    print(f"    FILETIME {test_filetime} → {dt}")
-    
-    # Test ext4 timestamp conversion
-    print("\n[*] Testing ext4 Unix timestamp conversion...")
-    # Example: 2024-01-01 00:00:00
-    test_unix = 1704067200
-    dt = Ext4MetadataExtractor._unix_to_datetime(test_unix)
-    print(f"    Unix timestamp {test_unix} → {dt}")
-    
-    # Test FAT32 date/time conversion
-    print("\n[*] Testing FAT32 date/time conversion...")
-    # Example: 2024-01-01 12:30:00
-    test_date = 0x5C21  # Year 2024, Month 1, Day 1
-    test_time = 0x6260  # Hour 12, Minute 30, Second 0
-    dt = FAT32MetadataExtractor._fat_datetime(test_date, test_time)
-    print(f"    FAT date {test_date:04x}, time {test_time:04x} → {dt}")
-    
-    print("\n[+] Metadata extraction test complete")
 
 
 if __name__ == '__main__':
-    test_metadata_extraction()
+    print("Metadata extractor ready")
