@@ -6,6 +6,22 @@ A comprehensive forensic analysis tool with an elegant Tkinter GUI for analyzing
 ![Python](https://img.shields.io/badge/python-3.8+-green)
 ![License](https://img.shields.io/badge/license-Educational-orange)
 
+
+# 1. Install dependencies
+pip install -r requirements_gui.txt
+
+# 2. Generate test data
+python3 generate_test_data.py
+
+# 3. Launch GUI
+./launch_forensic_gui.sh
+
+# 4. In GUI:
+#    - Click "Load USB Device" → Select "test_disk.img"
+#    - Click "Analyze Blocks"
+#    - Click "Run Correlation"
+#    - Explore the treemap visualization
+
 ## ✨ Features
 
 ### 🎨 Visual Analysis
