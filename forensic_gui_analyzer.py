@@ -25,6 +25,14 @@ from datetime import datetime
 from collections import defaultdict, namedtuple
 import math
 
+# Import metadata extractor
+try:
+    from metadata_extractor import GenericMetadataExtractor, MACBTimestamps
+    METADATA_EXTRACTOR_AVAILABLE = True
+except ImportError:
+    METADATA_EXTRACTOR_AVAILABLE = False
+    print("[!] metadata_extractor.py not found - using fallback timestamps")
+
 # Try to import E01 library (pyewf)
 try:
     import pyewf
@@ -122,6 +130,8 @@ class DiskAnalyzer:
         self.timeline = []
         self.reader = None
         self.total_blocks = 0
+        self.metadata_extractor = None  # Will be initialized when source is loaded
+        self.filesystem_type = 'Unknown'
         
     def load_source(self, source_path, source_type='auto'):
         """Load evidence source (E01 or raw device)"""
@@ -140,6 +150,15 @@ class DiskAnalyzer:
         
         self.reader.open()
         self.total_blocks = (self.reader.size + self.block_size - 1) // self.block_size
+        
+        # Initialize metadata extractor
+        if METADATA_EXTRACTOR_AVAILABLE:
+            print("[*] Initializing metadata extractor...")
+            self.metadata_extractor = GenericMetadataExtractor(self.reader)
+            self.filesystem_type = self.metadata_extractor.detect_filesystem()
+            print(f"[+] Filesystem detected: {self.filesystem_type}")
+        else:
+            print("[!] Metadata extractor not available - timestamps will be approximate")
         
         return True
     
@@ -161,7 +180,24 @@ class DiskAnalyzer:
                 head_data = block_data[:sample_size]
                 tail_data = block_data[-sample_size:] if len(block_data) > sample_size else block_data
                 
-                # Create block entry
+                # Extract real filesystem metadata with MACB timestamps
+                real_timestamps = None
+                if self.metadata_extractor:
+                    try:
+                        fs_metadata = self.metadata_extractor.extract_block_metadata(offset, self.block_size)
+                        if fs_metadata and fs_metadata.get('timestamps'):
+                            real_timestamps = fs_metadata['timestamps']
+                    except Exception as e:
+                        # If metadata extraction fails, continue without timestamps
+                        pass
+                
+                # Get timestamps or use None
+                mtime = real_timestamps.mtime if real_timestamps else None
+                ctime = real_timestamps.ctime if real_timestamps else None
+                atime = real_timestamps.atime if real_timestamps else None
+                btime = real_timestamps.btime if real_timestamps else None
+                
+                # Create block entry with REAL timestamps from disk
                 self.blocks[block_id] = BlockData(
                     block_id=block_id,
                     offset=offset,
@@ -170,10 +206,10 @@ class DiskAnalyzer:
                     head_data=head_data,
                     tail_data=tail_data,
                     metadata=self._extract_metadata(block_data),
-                    mtime=None,
-                    ctime=None,
-                    atime=None,
-                    btime=None
+                    mtime=mtime,  # Real modification time from disk
+                    ctime=ctime,  # Real change/creation time from disk
+                    atime=atime,  # Real access time from disk
+                    btime=btime   # Real birth time from disk
                 )
                 
                 blocks_analyzed += 1
@@ -781,7 +817,7 @@ class ForensicGUI:
         if not block_data:
             return
         
-        # Create tooltip
+        # Create tooltip with REAL timestamps from disk metadata
         tooltip_text = f"Block ID: {block_data.block_id}\n"
         tooltip_text += f"Offset: 0x{block_data.offset:08x}\n"
         tooltip_text += f"Size: {block_data.size} bytes\n"
@@ -791,9 +827,28 @@ class ForensicGUI:
         
         tooltip_text += f"Entropy: {block_data.metadata['entropy']:.2f}\n"
         
-        # Timestamps (would be from actual metadata)
-        tooltip_text += f"Modified: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        tooltip_text += f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        tooltip_text += "\nMACB Timestamps (from disk metadata):\n"
+        
+        # Show REAL timestamps from filesystem structures
+        if block_data.mtime:
+            tooltip_text += f"M (Modified): {block_data.mtime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            tooltip_text += f"M (Modified): Not available\n"
+        
+        if block_data.ctime:
+            tooltip_text += f"C (Changed):  {block_data.ctime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            tooltip_text += f"C (Changed):  Not available\n"
+        
+        if block_data.atime:
+            tooltip_text += f"A (Accessed): {block_data.atime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            tooltip_text += f"A (Accessed): Not available\n"
+        
+        if block_data.btime:
+            tooltip_text += f"B (Birth):    {block_data.btime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            tooltip_text += f"B (Birth):    Not available\n"
         
         self.hover_tooltip = self.canvas.create_text(
             x + 10, y + 10,
@@ -837,7 +892,8 @@ class ForensicGUI:
         self.metadata_text.delete('1.0', tk.END)
         metadata_info = f"Block ID: {block_data.block_id}\n"
         metadata_info += f"Offset: 0x{block_data.offset:08x}\n"
-        metadata_info += f"Size: {block_data.size} bytes\n\n"
+        metadata_info += f"Size: {block_data.size} bytes\n"
+        metadata_info += f"Filesystem: {self.analyzer.filesystem_type}\n\n"
         metadata_info += f"Metadata:\n"
         for key, value in block_data.metadata.items():
             metadata_info += f"  {key}: {value}\n"
@@ -848,15 +904,62 @@ class ForensicGUI:
         hex_view = self._format_hex(block_data.head_data)
         self.hex_text.insert('1.0', hex_view)
         
-        # Update timestamps
+        # Update timestamps with REAL MACB times from disk
         self.timestamp_text.delete('1.0', tk.END)
-        timestamp_info = f"Modified Time (mtime): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        timestamp_info += f"Created Time (ctime): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        timestamp_info += f"Accessed Time (atime): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        timestamp_info += f"Birth Time (btime): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        timestamp_info = "=== MACB Timestamps (from disk metadata) ===\n\n"
+        
+        if block_data.mtime:
+            timestamp_info += f"M - Modified Time (mtime):\n"
+            timestamp_info += f"    {block_data.mtime.strftime('%Y-%m-%d %H:%M:%S.%f')}\n"
+            timestamp_info += f"    Unix: {int(block_data.mtime.timestamp())}\n\n"
+        else:
+            timestamp_info += f"M - Modified Time (mtime):\n"
+            timestamp_info += f"    Not available in filesystem metadata\n\n"
+        
+        if block_data.ctime:
+            timestamp_info += f"C - Changed/Created Time (ctime):\n"
+            timestamp_info += f"    {block_data.ctime.strftime('%Y-%m-%d %H:%M:%S.%f')}\n"
+            timestamp_info += f"    Unix: {int(block_data.ctime.timestamp())}\n\n"
+        else:
+            timestamp_info += f"C - Changed/Created Time (ctime):\n"
+            timestamp_info += f"    Not available in filesystem metadata\n\n"
+        
+        if block_data.atime:
+            timestamp_info += f"A - Accessed Time (atime):\n"
+            timestamp_info += f"    {block_data.atime.strftime('%Y-%m-%d %H:%M:%S.%f')}\n"
+            timestamp_info += f"    Unix: {int(block_data.atime.timestamp())}\n\n"
+        else:
+            timestamp_info += f"A - Accessed Time (atime):\n"
+            timestamp_info += f"    Not available in filesystem metadata\n\n"
+        
+        if block_data.btime:
+            timestamp_info += f"B - Birth Time (btime):\n"
+            timestamp_info += f"    {block_data.btime.strftime('%Y-%m-%d %H:%M:%S.%f')}\n"
+            timestamp_info += f"    Unix: {int(block_data.btime.timestamp())}\n\n"
+        else:
+            timestamp_info += f"B - Birth Time (btime):\n"
+            timestamp_info += f"    Not available in filesystem metadata\n\n"
+        
+        # Add forensic analysis
+        timestamp_info += "\n=== Forensic Analysis ===\n\n"
+        
+        if block_data.mtime and block_data.ctime:
+            if block_data.mtime > block_data.ctime:
+                timestamp_info += "⚠️  WARNING: mtime > ctime\n"
+                timestamp_info += "    This is IMPOSSIBLE in normal operations!\n"
+                timestamp_info += "    Indicates possible TIMESTOMPING (anti-forensics)\n\n"
+            else:
+                timestamp_info += "✓  Timestamps appear normal\n\n"
+        
+        if block_data.mtime and block_data.atime:
+            if block_data.atime < block_data.mtime:
+                timestamp_info += "⚠️  WARNING: atime < mtime\n"
+                timestamp_info += "    File accessed before it was modified\n"
+                timestamp_info += "    Possible timestamp manipulation\n\n"
+        
         self.timestamp_text.insert('1.0', timestamp_info)
         
-        self.update_status(f"Selected block {block_id}")
+        self.update_status(f"Selected block {block_id} - Filesystem: {self.analyzer.filesystem_type}")
     
     def _format_hex(self, data):
         """Format data as hex dump"""
